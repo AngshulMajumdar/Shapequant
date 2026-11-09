@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shapequant: data-free noise-shaped quantization of LLMs</title>
+<meta name="description" content="Data-free, training-free quantization of Hugging Face causal LMs. The model supplies its own input statistics; rounding error is shaped away from where the inputs are.">
+<script>
+window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] }, svg: { fontCache: "global" } };
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+<style>
+  :root { --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --rule: #e6e5e0; --accent: #2a78d6; --code: #f2f1ed; }
+  * { box-sizing: border-box; }
+  html { background: var(--surface); }
+  body { margin: 0; color: var(--ink); font: 17px/1.62 Georgia, "Iowan Old Style", "Palatino Linotype", serif; }
+  header { border-bottom: 1px solid var(--rule); padding: 56px 24px 36px; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font: 700 2.1rem/1.2 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  .lede { color: var(--ink2); font-size: 1.12rem; margin: 0; max-width: 46rem; }
+  nav { margin-top: 22px; font: 500 .9rem system-ui, sans-serif; display: flex; gap: 18px; flex-wrap: wrap; }
+  nav a { color: var(--accent); text-decoration: none; }
+  main { padding: 8px 24px 80px; }
+  h2 { font: 700 1.35rem/1.3 system-ui, sans-serif; margin: 2.6rem 0 .6rem; padding-top: .6rem; border-top: 1px solid var(--rule); }
+  h3 { font: 600 1.05rem system-ui, sans-serif; margin: 1.6rem 0 .3rem; }
+  p, li { max-width: 46rem; }
+  figure { margin: 1.6rem 0 2rem; }
+  figure img { width: 100%; height: auto; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+  figcaption { color: var(--ink2); font-size: .92rem; margin-top: .5rem; max-width: 46rem; }
+  code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: .86rem; }
+  code { background: var(--code); padding: .1em .35em; border-radius: 4px; }
+  pre { background: var(--code); padding: 14px 16px; border-radius: 6px; overflow-x: auto; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; font: .9rem system-ui, sans-serif; margin: 1rem 0; width: 100%; }
+  th, td { border-bottom: 1px solid var(--rule); padding: 7px 10px; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink2); font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: .2rem 0 .2rem 1rem; color: var(--ink2); }
+  footer { border-top: 1px solid var(--rule); color: var(--ink2); font: .85rem system-ui, sans-serif; padding: 24px; }
+  @media (max-width: 640px) { body { font-size: 16px; } h1 { font-size: 1.7rem; } }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+  <h1>shapequant</h1>
+  <p class="lede">Data-free, training-free quantization of Hugging Face language models. No calibration text, no fine-tuning:
+  the model supplies its own input statistics, and rounding error is steered away from the directions its inputs occupy.
+  Output is a standard GPTQ-format INT4/INT8 checkpoint.</p>
+  <nav><a href="#problem">Problem</a><a href="#inputs">Input model</a><a href="#rounding">Rounding</a>
+  <a href="#evidence">Evidence</a><a href="#results">Results</a><a href="#scaling">Scaling to 70B</a><a href="#use">Use</a>
+  <a href="#limits">Limits</a><a href="https://github.com/AngshulMajumdar/shapequant">GitHub</a></nav>
+</div></header>
+<main><div class="wrap">
+
+<figure><img src="images/fig1_pipeline.png" alt="Pipeline: shards are read one layer at a time, the layer's input statistics are modelled from the weights, the weights are rounded with error feedback and packed, and a residual-stream state is carried to the next layer.">
+<figcaption>Figure 1. The whole model is never resident. Each decoder layer is read, its input statistics are modelled from the
+weights, it is rounded and packed, and only a \(d\times d\) residual-stream state is carried forward.</figcaption></figure>
+
+<h2 id="problem">The problem</h2>
+<p>A linear block computes \(y = xW\). Quantization replaces \(W\) by \(\hat W\) on a grid. With \(R = W-\hat W\), the
+expected output error over inputs with second moment \(\Sigma = \mathbb{E}[x x^\top]\) is</p>
+\[ \mathbb{E}\,\lVert x R\rVert^2 \;=\; \operatorname{tr}\!\left(R^\top \Sigma\, R\right). \]
+<p>Round-to-nearest (RTN) ignores \(\Sigma\). Its error is close to white, which is optimal only if \(\Sigma\propto I\).
+Calibration-based methods such as GPTQ estimate \(\Sigma\) from sample text. <em>shapequant</em> uses no text. It builds
+a surrogate \(S\approx\Sigma\) from the weights and the architecture, then rounds so that \(\operatorname{tr}(R^\top H R)\)
+is small, with</p>
+\[ H \;=\; I + \lambda S, \qquad \lambda = 1. \]
+<p>The identity term makes this the minimax design against an unknown perturbation of bounded size: if
+\(\Sigma = S + E\) with \(0 \preceq E \preceq \rho I\), the worst case is \(S+\rho I\), and the optimal design for it is that matrix.</p>
+
+<figure><img src="images/fig2_where_error_goes.png" alt="Two panels with the same input cloud: round-to-nearest gives a circular error covariance; shaped rounding gives an elongated error covariance perpendicular to the input cloud and a smaller output error.">
+<figcaption>Figure 2. Same rounding-error power, different direction. Moving the error into directions the inputs rarely
+visit lowers \(\operatorname{tr}(\Sigma C)\), here from 5.14 to 1.95.</figcaption></figure>
+
+<h2 id="inputs">The model supplies its own input statistics</h2>
+<p>Every decoder input is a function of the residual stream, and the residual stream is written by the model's own matrices.
+That makes the second moments derivable from the weights alone.</p>
+<h3>Residual stream</h3>
+<p>Token ids of byte-level BPE vocabularies are assigned in merge order, which tracks corpus frequency. A Zipf prior on the id
+therefore gives the layer-0 moment from the embedding table \(e_t\) (plus learned positions \(p_s\), where present):</p>
+\[ \Sigma^{(0)} = \sum_t \pi_t\, e_t e_t^\top \;+\; \tfrac1T \sum_s p_s p_s^\top, \qquad \pi_t \propto \frac{1}{t+10}. \]
+<p>Each writer into the stream (attention output \(W_o\), MLP output \(W_{\text{down}}\)) adds its contribution under an
+isotropic-input assumption:</p>
+\[ \Sigma^{(\ell)} \leftarrow \Sigma^{(\ell)} + W_o^\top W_o, \qquad \Sigma^{(\ell)} \leftarrow \Sigma^{(\ell)} + W_{\text{down}}^\top W_{\text{down}}. \]
+<h3>Normalisation layers</h3>
+<p>With gain \(g\), bias \(\beta\), centring projector \(P = I - \tfrac1n \mathbf 1\mathbf 1^\top\) and residual mean \(m\):</p>
+\[ \text{LayerNorm: } C = \frac{P\Sigma P}{\operatorname{tr}(P\Sigma P)/n},\;\; \operatorname{cov} = g\circ C\circ g,\;\; \mu = \beta
+\qquad \text{RMSNorm: } C = \frac{\Sigma}{\operatorname{tr}(\Sigma)/n},\;\; \mu = \frac{g\circ m}{\sqrt{\operatorname{tr}(\Sigma)/n}}. \]
+<h3>MLP second input</h3>
+<p>The input of the down projection is the layer's own nonlinearity applied to the normalised stream (ReLU, GELU or
+SiLU-gated). Its second moment is estimated by Monte Carlo from the model-implied Gaussian:</p>
+\[ S_{\text{act}} = \mathbb{E}\!\left[\varphi(x)\varphi(x)^\top\right],\quad x\sim\mathcal N(\mu,\operatorname{cov}),\quad
+\varphi(x) = \operatorname{silu}(xW_g)\odot(xW_u) \text{ or } \operatorname{relu}(xW_1+b_1). \]
+<h3>Attention output</h3>
+<p>The attention output of head \(h\) is a convex mixture of value vectors. With value mean \(\mu_v\), value covariance \(C_v\)
+of the head's KV group (grouped-query attention included) and concentration \(\kappa=\mathbb E\sum_t a_t^2\):</p>
+\[ S_{\text{attn}} = \mu_o\mu_o^\top + \kappa\,\operatorname{blockdiag}_h\!\big(C_v^{(g(h))}\big), \qquad \kappa = 1. \]
+<p>Every \(S\) is scaled to trace \(n\), so \(\lambda=1\) means the same weight for the identity part and the model part.</p>
+
+<figure><img src="images/fig3_input_model.png" alt="Diagram: embeddings under a Zipf prior seed the residual stream; normalisation, attention output and MLP nonlinearity each produce a covariance S for the modules that read them.">
+<figcaption>Figure 3. Four input types per layer, each with its own model-implied second moment.</figcaption></figure>
+
+<h2 id="rounding">Rounding with error feedback</h2>
+<p>For a fixed grid, minimising \(\operatorname{tr}(R H R^\top)\) over grid points is solved sequentially over input
+columns. The rounding error of each column is fed forward to the columns not yet rounded. With
+\(H^{-1} = U^\top U\) (\(U\) upper-triangular):</p>
+\[ q_i = \operatorname{round}_{\text{grid}}(w_i),\qquad e_i = \frac{w_i - q_i}{U_{ii}},\qquad
+w_j \leftarrow w_j - e_i\,U_{ij}\quad (j>i). \]
+<p>With \(H = I\), \(U = I\) and this is exactly round-to-nearest. Under the high-resolution model the expected output MSE of
+this recursion with design \(H = LDL^\top\) is</p>
+\[ \mathbb{E} = \frac{\Delta^2}{12}\, m\,\operatorname{tr}\!\left(L^{-1}\Sigma L^{-\top}\right), \]
+<p>which equals RTN's \(\tfrac{\Delta^2}{12} m\operatorname{tr}\Sigma\) at \(H = I\) and is smallest at \(H=\Sigma\). Its gain over
+RTN is bounded by the spectral flatness of the true input covariance:</p>
+\[ \frac{\operatorname{tr}\Sigma}{\operatorname{tr} D_\Sigma} \;\le\; \frac{\operatorname{AM}\!\left(\lambda(\Sigma)\right)}{\operatorname{GM}\!\left(\lambda(\Sigma)\right)}. \]
+<p>The grid is the standard asymmetric GPTQ grid (range includes 0, integer zero-point, groups along the input).
+Each group's grid is fitted to the error-fed weights when the group starts. Updates are applied lazily in blocks of 128
+columns. Modules that read the same input (q/k/v, gate/up) are stacked and rounded in one pass.</p>
+
+<figure><img src="images/fig4_error_feedback.png" alt="Grid of weight columns: columns left of column i are rounded, column i is being rounded, and arrows carry its error to the remaining columns. Pseudocode on the right.">
+<figcaption>Figure 4. The error-feedback recursion. Only the design matrix \(H\) differs from round-to-nearest.</figcaption></figure>
+
+<h2 id="evidence">How good is the data-free covariance?</h2>
+<p>The two diagnostics below use held-out text only to <em>evaluate</em> the surrogate; the method never sees it.</p>
+<figure><img src="images/fig5_spectrum.png" alt="Log-log eigenvalue spectra: true covariance falls steeply over three decades; the data-free surrogate is flatter; round-to-nearest corresponds to a flat line at 1.">
+<figcaption>Figure 5. The data-free \(S\) captures the dominant directions but is flatter than the true spectrum (cosine
+similarity 0.34 here). The true spectrum's AM/GM ratio of 7.4 bounds what any error-feedback method could gain on this input.</figcaption></figure>
+<figure><img src="images/fig6_layer_error.png" alt="Bars per module for three layers: data-free design reduces output error to 0.52 to 0.99 of RTN; the true covariance would reach 0.15 to 0.39.">
+<figcaption>Figure 6. Exact per-layer output error \(\operatorname{tr}(R^\top\Sigma R)\) relative to round-to-nearest. The
+data-free design always helps (geometric mean 0.87). The true covariance shows the headroom (0.28).</figcaption></figure>
+
+<h2 id="results">Results</h2>
+<p>WikiText-2 test, 32 windows of 1024 tokens, one run per setting. The INT4 groups are 128 (GPT-2, OPT) or 64 (SmolLM2,
+hidden size 576). "Mixed" assigns INT4, INT8 or FP16 per module under an average budget (4.75 or 5.0 bits/weight).
+The modules that write linearly into the residual stream (V, attention output, MLP output) are weighted 4× in that allocation.</p>
+<figure><img src="images/fig7_perplexity.png" alt="Three panels of perplexity bars: GPT-2 and OPT improve with shapequant at INT4 and mixed precision; SmolLM2 is unchanged.">
+<figcaption>Figure 7. Perplexity, lower is better.</figcaption></figure>
+<table>
+<thead><tr><th>model</th><th>fp16</th><th>RTN INT4</th><th>shaped INT4</th><th>RTN mixed</th><th>shaped mixed</th></tr></thead>
+<tbody>
+<tr><td>GPT-2 124M</td><td>26.84</td><td>29.91</td><td><b>29.14</b></td><td>29.62</td><td><b>28.86</b></td></tr>
+<tr><td>OPT-125m</td><td>29.27</td><td>31.98</td><td><b>31.39</b></td><td>30.71</td><td><b>30.44</b></td></tr>
+<tr><td>SmolLM2-135M (Llama)</td><td>15.46</td><td><b>19.28</b></td><td>19.29</td><td><b>17.82</b></td><td>17.83</td></tr>
+</tbody></table>
+<p class="note">At standard INT4 the gains are modest: −2.6% (GPT-2), −1.9% (OPT), none on SmolLM2. The layer-level error
+reductions of Figure 6 only partly carry through to perplexity. In the research experiments the gains were much larger at
+3 bits (−22% to −43%). 3-bit is not a standard packed format and is not exported.</p>
+
+<h2 id="scaling">Scaling to 70B</h2>
+<p>Peak device memory is about one decoder layer in fp32 plus two \(n\times n\) fp32 matrices for the widest input. For Llama-3.1-70B that input is
+the 28 672-wide MLP input. The estimate below comes from the real configurations (<code>shapequant memory</code>).</p>
+<figure><img src="images/fig8_scaling.png" alt="Left: estimated device peak grows from about 4 GB at 7B to about 22 GB at 72B, under a 24 GB line. Right: checkpoint size, fp16 vs INT4, on log axes.">
+<figcaption>Figure 8. Memory during quantization grows with layer width, not with depth or parameter count. These are estimates;
+an end-to-end 70B run has not been performed. The attention-sized steps were run at full 70B shapes on CPU (q/k/v stacked 26 s,
+o_proj 19 s).</figcaption></figure>
+
+<h2 id="use">Use</h2>
+<pre><code>pip install -e .
+shapequant memory meta-llama/Llama-3.1-70B
+shapequant quantize meta-llama/Llama-3.3-70B-Instruct out70b --bits 4 --group-size 128 --device cuda
+shapequant quantize HuggingFaceTB/SmolLM2-135M smol --budget 5.0 --group-size 64
+shapequant eval smol --windows 32</code></pre>
+<pre><code>from shapequant import quantize_model, load_quantized
+quantize_model("facebook/opt-125m", "opt-int4", bits=4, group_size=128)
+model = load_quantized("opt-int4")</code></pre>
+<p>Checkpoint format (GPTQ v1, as written by AutoGPTQ/GPTQModel):</p>
+<ul>
+<li><code>qweight</code>, <code>qzeros</code> (stored as \(z-1\)), <code>scales</code> and <code>g_idx</code>, with
+<code>sym=False</code> and <code>desc_act=False</code>.</li>
+<li>Per-module INT8 or FP16 overrides go in <code>quantization_config["dynamic"]</code>.</li>
+<li>The bundled loader needs only torch and transformers.</li>
+</ul>
+
+<h2 id="limits">Limits</h2>
+<ul>
+<li><b>Gains:</b> small at standard INT4, and none on the Llama-architecture model tested.</li>
+<li><b>Models tested:</b> three small models only, one run per setting.</li>
+<li><b>70B:</b> no end-to-end run yet. The MLP-sized steps need about 7 GB that the test machine did not have.</li>
+<li><b>Serving:</b> loading with GPTQModel or vLLM GPU kernels has not been tested. The format follows the GPTQ v1 layout.</li>
+<li><b>Architectures:</b> llama, mistral, qwen2, pre-LN opt and gpt2. Gemma-style norms and MoE are not supported.</li>
+</ul>
+</div></main>
+<footer><div class="wrap">shapequant · MIT · Angshul Majumdar, IIIT Delhi</div></footer>
+</body>
+</html>
